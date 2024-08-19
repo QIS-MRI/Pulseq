@@ -1,0 +1,242 @@
+##
+# write_pulseq_PhaseCycledbSSFP.py
+# Written by Kelly Bonzon, Yasaman Safarkhanlo
+# Upload date: 19/08/2024 Last modified: 19/08/2024
+
+#%% Imports
+import numpy as np
+import math as math
+import datetime
+import os
+import matplotlib.pyplot as plt
+from pypulseq.Sequence.sequence import Sequence
+from pypulseq.opts import Opts
+from pypulseq.make_adc import make_adc
+from pypulseq.make_trapezoid import make_trapezoid
+from pypulseq.make_block_pulse import make_block_pulse
+from pypulseq.calc_duration import calc_duration
+from pypulseq.split_gradient_at import split_gradient_at
+from pypulseq.add_gradients import add_gradients
+from pypulseq.make_delay import make_delay
+
+#%% Gradient Modes
+# This section sets different gradient modes that determine the maximum
+# gradient strength and slew rate, which are important for controlling the
+# speed and smoothness of the gradient transitions.
+
+grad_mode = 'Normal' # Default gradient mode
+
+# Set maximum gradient strength and slew rate based on the chosen gradient mode
+if grad_mode == 'Fast':
+    max_grad = 24   # Max gradient strength [mT/m]
+    max_slew = 180  # Maximum slew rate [mT/m/ms]
+elif grad_mode == 'Normal':
+    max_grad = 22
+    max_slew = 100
+elif grad_mode == 'Whisper':
+    max_grad = 22
+    max_slew = 50
+elif grad_mode == 'Performance':
+    max_grad = 37
+    max_slew = 188
+    
+#%% System Limits
+# Define the system hardware limits using the Pulseq options.
+sys = Opts(
+    max_grad=max_grad,
+    grad_unit='mT/m',
+    max_slew=max_slew,
+    slew_unit='T/m/s',
+    rf_ringdown_time=20e-6,
+    rf_dead_time=100e-6,
+    adc_dead_time=20e-6)
+
+#%% Start a Sequence
+# Initialize a new Pulseq sequence object with the defined system limits.
+seq = Sequence()
+
+# Define the resolution and field of view (FOV).
+res = np.array([1, 1, 3])                # Resolution in x, y, z directions
+fov = np.array([384e-3, 192e-3, 192e-3]) # Field of view in meters
+
+# Calculate the delta k-space values
+deltak = 1 / fov                         
+
+# Matrix size in x, y, z directions.
+Nx = 384 
+Ny = 192
+Nz = 64
+
+# Calculate the area covered per kernel in Z and Y directions.
+areaZ = (np.arange(Nz) - Nz / 2) * deltak[2]
+areaY = (np.arange(Ny) - Ny / 2) * deltak[1]
+    
+# RF excitation parameters  
+alpha = 20          # RF excitation flip angle in degrees
+TR_wish = 5.02      # Repetition time in milliseconds
+adc_dur = 384*3     # ADC (Analog-to-Digital Converter) duration in microseconds
+
+# Number of dummy pulses to reach steady state
+N_dummy = 1000 
+
+# Phase cycle increments in degrees
+pc = np.arange(0, 360, 20) 
+
+# RF pulse parameters
+rf_dur = 500        # RF pulse duration in microseconds
+rf_apo = 1          # RF pulse apodization factor
+rf_bwt = 3          # RF pulse bandwidth-time product                             
+
+# Create the RF pulse with the given parameters
+rf = make_block_pulse(flip_angle=alpha * np.pi / 180, duration=rf_dur * 1e-6, system=sys)
+
+# Create the gradient along the x-axis for the readout
+gx = make_trapezoid(channel='x', flat_area=Nx * deltak[0], flat_time=adc_dur * 1e-6, system=sys)
+
+# Create the ADC object to sample the signal during the readout gradient
+adc = make_adc(num_samples=Nx, duration=gx.flat_time, delay=gx.rise_time, system=sys)
+
+# Create the pre-phasing gradient (negative lobe) for the readout
+gx_pre = make_trapezoid(channel='x', area=-gx.area / 2, system=sys)    
+gx_pre.delay = 0
+
+# Splitting R.O. gradient to rise_and_flat + fall to be able to start
+# rephasers of PE and SE gradients right after flat time of R.O. grad
+gx_parts = split_gradient_at(gx, math.ceil(calc_duration(adc)/sys.grad_raster_time)*sys.grad_raster_time)
+gx_parts[0].delay = calc_duration(gx_pre)
+
+# adding RO_pre, RO_rise_and_flat to make them consistently concat (pulseq related)
+gx_1 = add_gradients([gx_pre, gx_parts[0]], system=sys)
+
+# giving ADC additional delay to wait for the prephaser or R.O. gradient
+adc.delay = adc.delay + calc_duration(gx_pre)
+
+# Removing any delay of fall of RO to be able start right after flat of RO
+gx_parts[1].delay = 0
+
+# adding RO_fall and RO_pre to make them consistently concat (pulseq related)
+gx_2 = add_gradients([gx_parts[1], gx_pre], system=sys)
+    
+    
+#%% Phase Encoding Gradients   
+# Phase encoding gradients for Y and Z directions
+
+# Calculating the maximum required PE pre and rephasers to use their
+# duration later (for consistent TR)
+gy_pre = make_trapezoid(channel='y', area= -1*max(abs(areaY)), system=sys)
+gy_reph = make_trapezoid(channel='y', area= max(abs(areaY)), system=sys)
+
+# Calculating the maximum required SE pre and rephasers to use their
+# duration later (for consistent TR)
+gz_pre = make_trapezoid(channel='z', area= -1*max(abs(areaZ)), system=sys)
+gz_reph = make_trapezoid(channel='z', area= max(abs(areaZ)), system=sys)
+
+# Using duration of the maximum duration required by the 
+# largest SE or PE prephaser gradients
+max_T_pre = max([calc_duration(gz_pre), calc_duration(gy_pre)])
+
+
+# Creating one kernel and checking TR
+seq.add_block(rf)
+seq.add_block(gx_1,gy_pre,gz_pre,adc)
+seq.add_block(gx_2,gy_reph,gz_reph)
+
+TR_kernel = seq.duration()[0] # s
+print(f"Minimum TR obtainable: {1e3 * TR_kernel:.3f} ms") # ms
+
+# Create a delay object to fix to the desired TR
+if TR_wish>TR_kernel:
+    delay_fix = make_delay((TR_wish-1e3*TR_kernel)*1e-3) # s
+    delay_flag = 1
+    seq.add_block(delay_fix)
+    TR_kernel = seq.duration()[0]
+    print(f"TR: {1e3 * TR_kernel:.8f} ms")
+    
+seq = None
+
+#%%
+seq = Sequence(sys)
+
+##  Loop over phase cycles
+# This loop goes through each phase cycle and creates the sequence blocks.
+for index, pci in enumerate(pc, start=1):
+    print(index, pci)  
+    rf_phase_off = pci * np.pi / 180 # Set the RF phase offset
+    
+    # Dummy Scans for Steady State
+    # No ADC during dummy scans
+    # This section adds dummy pulses to reach the steady state before the actual acquisition.
+    for _ in range(N_dummy):
+        rf_phase_off = (rf_phase_off + pci * np.pi/180) % (2 * np.pi)
+        rf.phase_offset = rf_phase_off
+        
+        # Define the sequence blocks for each TR
+        seq.add_block(rf) 
+        seq.add_block(gx_1) 
+        seq.add_block(gx_2)
+        
+        # Optional delay for TR timing adjustment
+        if delay_flag:
+            seq.add_block(delay_fix)
+    
+    # Loop over slice encoding direction        
+    for iZ in range(Nz):
+        gz_pre = make_trapezoid(channel='z', area=areaZ[iZ], duration=max_T_pre, system=sys)
+        gz_reph = make_trapezoid(channel='z', area=-areaZ[iZ], duration=max_T_pre, system=sys)
+        
+        # Loop over phase encoding direction       
+        for i in range(Ny):
+            rf_phase_off = (rf_phase_off + pci * np.pi/180) % (2 * np.pi)
+            rf.phase_offset = rf_phase_off
+            adc.phase_offset = (rf_phase_off + np.pi / 2) % (2 * np.pi)
+            seq.add_block(rf) 
+            
+            gy_pre = make_trapezoid(channel='y', area=-areaY[i], duration=max_T_pre, system=sys)
+            gy_reph = make_trapezoid(channel='y', area=areaY[i], duration=max_T_pre, system=sys)
+            
+            # Prephase and rephase and sample (ADC on)
+            seq.add_block(gx_1, gy_pre, gz_pre, adc)
+            seq.add_block(gx_2, gy_reph, gz_reph)
+            
+            # If we want a TR larger then min. obtainable TR, add delay
+            if delay_flag:
+                seq.add_block(delay_fix)
+                
+
+# Check and output the sequence timing
+ok, error_report = seq.check_timing()
+if ok:
+    print('Timing check passed successfully.')
+else:
+    print('Timing check failed! Error listing follows:')
+    print(error_report)
+    
+print('Sequence ready.')
+receive_bw = 1 / (adc.dwell * Nx)
+total_duration = seq.duration()[0] 
+TR = 1000 * total_duration / (len(pc) * (Ny * Nz + N_dummy))
+res = 1000 * fov / np.array([Nx, Ny, Nz])
+print(f"TR = {TR:.5f} ms, res = {res}, receive_bw = {receive_bw:.5f}")
+
+#%% Export the Sequence
+# Export the created sequence to a .seq file which can be used on an MRI scanner.
+seq.set_definition('FOV', fov)
+seq.set_definition('Name', 'trufi')
+
+TR_str = f"{TR:.3f}".replace('.', 'p')
+adc_dur_str = adc_dur
+alpha_str = alpha
+bw_str = int(receive_bw)
+fov_str = "x".join([str(int(val * 1000)) for val in fov]) 
+date_str = datetime.datetime.now().strftime("%d%m%Y_%Hh%M")
+
+seq_filename = f"pypulseq_TR{TR_str}_FA{alpha_str}_adc{adc_dur_str}_Nz{Nz}_BW{bw_str}_FOV{fov_str}_RE1x1x3_18PC_{date_str}"
+
+print("Sequence Name:", seq_filename)
+
+save_path = os.path.join(os.getcwd(), seq_filename + '.seq')
+seq.write(save_path)
+
+#%% Plot the sequence  
+seq.plot(label="lin", time_disp="s")   
+
