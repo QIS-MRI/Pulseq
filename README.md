@@ -11,9 +11,9 @@ Matlab and Python codes to write a 3D Phase-Cycled bSSFP Cartesian Sequence in t
 
 ## Sequence parameters
 
-| FOV [mm]     | Spatial Resolution | TR [ms] | TE [ms] | Flip Angle [°] | Number of Phase Cycles | BW [Hz] |
-|--------------|--------------------|---------|---------|----------------|------------------------|---------|
-|  384x192x192 |     384x192x64     |  5.02   |   2.51  |       20       |           18           |   868   |
+| FOV [mm]     | Spatial Resolution | TR [ms] | TE [ms] | RF Excitation Angle [°] | Number of Phase Cycles | BW [Hz] |
+|--------------|--------------------|---------|---------|-------------------------|------------------------|---------|
+|  384x192x192 |     384x192x64     |  5.02   |   2.51  |       20                |           18           |   868   |
 
 ## Diagram
 
