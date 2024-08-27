@@ -16,4 +16,6 @@ Matlab and Python codes to write a 3D Phase-Cycled bSSFP Cartesian Sequence in t
 |  384x192x192 |     384x192x64     |  5.02   |   2.51  |       20                |           18           |   868   |
 
 ## Diagram
+![Diagram of the 3D Phase-cycled bSSFP sequence. RF pulse application followed by 
+acquisition with ADC event and balanced gradients. ](seq_diagram.png)
 
